@@ -1257,3 +1257,180 @@ class AuditService:
             pa["x"] + (pb["x"] - pa["x"]) * ratio,
             pa["y"] + (pb["y"] - pa["y"]) * ratio,
         )
+
+    # ------------------------------------------------------------------
+    # 单车危险区风险预算复核
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_positive_finite(raw: Any, label: str) -> float:
+        """校验正且有限的数值（非法值 400）。"""
+        if isinstance(raw, bool):
+            raise ValidationError(f"{label}必须是正且有限的数值，收到: {raw!r}")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise ValidationError(f"{label}必须是正且有限的数值，收到: {raw!r}")
+        if not math.isfinite(value) or value <= 0:
+            raise ValidationError(f"{label}必须是正且有限的数值，收到: {raw!r}")
+        return value
+
+    def query_risk_budget(self, trip_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """复核单车一次作业 [since, until) 内的危险区风险预算。
+
+        - `zone_weights`：非空 {危险区ID: 正且有限风险权重} 映射；`budget`：正且有限加权秒数；
+        - 可选区域修订号与轨迹版本，未指定项取**同一已提交读视图**中的最新已提交状态；
+        - 各区占用沿用既有规则（相邻点线性插值、区域 UTC 半开生效窗口、带洞边界、
+          零时长接触不计）；轨迹未覆盖或不在指定区内的时间不计入；
+        - 重叠区域同时占用时只按最高权重计入；相接且权重相同的区间合并；
+        - 返回按时间排列的恒权重正时长区间、各段及总计加权秒数、累计值首次达到
+          预算的时刻（未达到为 null）；无暴露返回零总计与空区间。
+        """
+        if not isinstance(trip_id, str) or not trip_id.strip():
+            raise ValidationError("trip_id 必须是非空字符串")
+        trip_id = trip_id.strip()
+
+        # ---- 请求校验（时间范围 / 权重映射 / 预算 / 版本格式）----
+        try:
+            lo = parse_utc(payload.get("since"), field="since").timestamp()
+            hi = parse_utc(payload.get("until"), field="until").timestamp()
+        except TimeError as exc:
+            raise ValidationError(str(exc)) from exc
+        if lo >= hi:
+            raise ValidationError("since 必须早于 until（查询范围为半开 [since, until)）")
+
+        zone_weights_raw = payload.get("zone_weights")
+        if not isinstance(zone_weights_raw, dict) or not zone_weights_raw:
+            raise ValidationError("zone_weights 必须是非空的 {危险区ID: 风险权重} 映射")
+        weights: Dict[str, float] = {}
+        for zid_raw, raw_w in zone_weights_raw.items():
+            if not isinstance(zid_raw, str) or not zid_raw.strip():
+                raise ValidationError("zone_weights 的危险区 ID 必须是非空字符串")
+            zid = zid_raw.strip()
+            if zid in weights:
+                raise ValidationError(f"zone_weights 中危险区重复: {zid!r}")
+            weights[zid] = self._validate_positive_finite(
+                raw_w, f"zone_weights[{zid!r}] 风险权重"
+            )
+
+        budget = self._validate_positive_finite(payload.get("budget"), "budget 加权秒数预算")
+
+        pinned_rev = payload.get("revision") is not None
+        revision = (
+            _validate_revision_param(payload.get("revision")) if pinned_rev else None
+        )
+
+        pinned_track = payload.get("track_version") is not None
+        track_version = (
+            self._validate_track_version_value(payload.get("track_version"))
+            if pinned_track
+            else None
+        )
+
+        # ---- 同一已提交读视图：区域（含指定修订号）与车次点集（含指定/最新版本）一次快照读取 ----
+        with self.db.read_view() as conn:
+            if pinned_rev:
+                head_rev = self.db._current_revision(conn)
+                if revision > head_rev:
+                    raise NotFoundError(
+                        f"修订号 {revision} 超出当前范围：当前最新修订号为 {head_rev}"
+                        + ("（尚无任何区域登记）" if head_rev == 0 else "")
+                    )
+
+            if pinned_track:
+                baseline, head = self.db._trip_version_info(conn, trip_id)
+                self._check_track_version_range(trip_id, track_version, baseline, head)
+                points = self.db._list_trip_point_version_rows(conn, trip_id, track_version)
+                version_used = track_version
+            else:
+                vrow = self.db._trip_version_row(conn, trip_id)
+                points = self.db._list_trip_points(conn, trip_id)
+                if vrow is None and not points:
+                    raise NotFoundError(f"车次不存在（无轨迹数据）: {trip_id}")
+                version_used = 0 if vrow is None else int(vrow["version"])
+
+            zone_rows: Dict[str, Any] = {}
+            for zid in weights:
+                if pinned_rev:
+                    zrow = self.db._zone_row_at(conn, zid, revision)
+                    if zrow is None:
+                        raise NotFoundError(
+                            f"修订号 {revision} 的配置中危险区尚未登记: {zid}"
+                        )
+                else:
+                    zrow = self.db._latest_zone_row(conn, zid)
+                    if zrow is None:
+                        raise NotFoundError(f"危险区不存在: {zid}")
+                zone_rows[zid] = zrow
+
+            # 各区占用区间附上该区风险权重（同一快照数据，纯计算）
+            weighted_occupancy: List[Tuple[float, float, float]] = [
+                (s, e, weights[zid])
+                for zid, zrow in zone_rows.items()
+                for s, e in self._coverage_intervals(zrow, points, lo, hi)
+            ]
+
+        # ---- 扫描线分段：任意时刻只按同时占用区中的最高权重计入，相接同权重合并 ----
+        events = sorted(
+            {s for s, _e, _w in weighted_occupancy}
+            | {e for _s, e, _w in weighted_occupancy}
+        )
+        segments: List[List[float]] = []  # [start, end, weight]
+        for a, b in zip(events, events[1:]):
+            if b - a <= self.min_duration:
+                continue  # 零时长分段不计
+            mid = (a + b) / 2.0
+            weight = max(
+                (w for s, e, w in weighted_occupancy if s <= mid < e),
+                default=None,
+            )
+            if weight is None:
+                continue  # 轨迹未覆盖或不在指定区内的时间不计入
+            if segments and segments[-1][2] == weight and a - segments[-1][1] <= 1e-6:
+                segments[-1][1] = b  # 相接且权重相同：合并
+            else:
+                segments.append([a, b, weight])
+
+        # ---- 各段与总计加权秒数、累计值首次达到预算的时刻 ----
+        # 段内权重恒定，累计值随时间线性增长；相对容差吸收浮点误差，
+        # 使“预算恰等于总计”这类边界也能落在段末时刻
+        tolerance = 1e-9 * max(1.0, budget)
+        intervals: List[Dict[str, Any]] = []
+        total = 0.0
+        reached_at: Optional[float] = None
+        for s, e, weight in segments:
+            duration = e - s
+            weighted = weight * duration
+            if reached_at is None and weighted >= budget - total - tolerance:
+                offset = min(max((budget - total) / weight, 0.0), duration)
+                reached_at = s + offset
+            total += weighted
+            intervals.append(
+                {
+                    "start": _iso_z(datetime.fromtimestamp(s, timezone.utc)),
+                    "end": _iso_z(datetime.fromtimestamp(e, timezone.utc)),
+                    "duration_sec": round(duration, 6),
+                    "weight": weight,
+                    "weighted_sec": round(weighted, 6),
+                }
+            )
+
+        result: Dict[str, Any] = {
+            "trip_id": trip_id,
+            "since": _iso_z(datetime.fromtimestamp(lo, timezone.utc)),
+            "until": _iso_z(datetime.fromtimestamp(hi, timezone.utc)),
+            "budget": budget,
+            "zone_weights": weights,
+            "track_version": version_used,
+            "point_count": len(points),
+            "intervals": intervals,
+            "total_weighted_sec": round(total, 6),
+            "budget_reached_at": (
+                _iso_z(datetime.fromtimestamp(reached_at, timezone.utc))
+                if reached_at is not None
+                else None
+            ),
+        }
+        if pinned_rev:
+            result["revision"] = revision
+        return result

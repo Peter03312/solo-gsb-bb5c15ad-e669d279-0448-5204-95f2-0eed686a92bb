@@ -104,6 +104,37 @@ class CoOccupancyQuery(BaseModel):
     )
 
 
+class RiskBudgetQuery(BaseModel):
+    """单车危险区风险预算复核请求：一次作业 [since, until) 内按最高权重计入的加权秒数。
+
+    重叠区域同时占用时只按最高权重计入；轨迹未覆盖或不在指定区内的时间不计入。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    since: str = Field(..., description="查询起始 UTC ISO 8601（含），必须带时区")
+    until: str = Field(..., description="查询结束 UTC ISO 8601（不含），必须带时区")
+    zone_weights: Dict[str, Annotated[float, Field(gt=0, allow_inf_nan=False)]] = Field(
+        ...,
+        min_length=1,
+        description="非空 {危险区ID: 风险权重} 映射；权重必须为正且有限",
+    )
+    budget: float = Field(
+        ...,
+        gt=0,
+        allow_inf_nan=False,
+        description="加权秒数预算：正且有限；返回累计值首次达到预算的时刻",
+    )
+    revision: Optional[int] = Field(
+        default=None, ge=1, description="可选区域修订号：按截至该号的各区最后配置核算"
+    )
+    track_version: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="可选轨迹版本号：按该版本保留的有效点集核算；省略取查询时最新已提交状态",
+    )
+
+
 class ProximityQuery(BaseModel):
     """危险区内近距离相遇复核请求：两车同时位于区内且平面距离严格小于阈值的时段。"""
 
