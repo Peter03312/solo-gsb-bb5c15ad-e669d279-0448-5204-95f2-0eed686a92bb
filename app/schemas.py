@@ -104,6 +104,36 @@ class CoOccupancyQuery(BaseModel):
     )
 
 
+class RiskBudgetQuery(BaseModel):
+    """单车一次作业危险区风险预算复核请求。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    since: str = Field(..., description="查询起始 UTC ISO 8601（含），必须带时区")
+    until: str = Field(..., description="查询结束 UTC ISO 8601（不含），必须带时区")
+    zone_weights: Dict[
+        Annotated[str, Field(min_length=1)],
+        Annotated[float, Field(gt=0, strict=True, allow_inf_nan=False)],
+    ] = Field(
+        ...,
+        min_length=1,
+        description="非空危险区 ID -> 正且有限风险权重映射；仅这些区参与核算",
+    )
+    budget_weighted_sec: Annotated[
+        float, Field(gt=0, strict=True, allow_inf_nan=False)
+    ] = Field(
+        ..., description="正且有限的加权秒数预算"
+    )
+    revision: Optional[int] = Field(
+        default=None, ge=1, description="可选区域修订号：按截至该号的区域配置核算"
+    )
+    track_version: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="可选轨迹版本号：按该版本保留的有效点集核算，响应回填实际使用版本",
+    )
+
+
 class ProximityQuery(BaseModel):
     """危险区内近距离相遇复核请求：两车同时位于区内且平面距离严格小于阈值的时段。"""
 

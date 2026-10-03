@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from .config import get_settings
 from .db import Database
-from .schemas import CoOccupancyQuery, CorrectionBatch, PointBatch, ProximityQuery, ZoneCreate
+from .schemas import CoOccupancyQuery, CorrectionBatch, PointBatch, ProximityQuery, RiskBudgetQuery, ZoneCreate
 from .service import AuditService, ConflictError, NotFoundError, ValidationError
 
 settings = get_settings()
@@ -26,7 +26,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="工地作业车危险区穿越审计服务",
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
     description=(
         "登记带洞米制多边形危险区及其 UTC 半开生效时段；每次登记原子产生全局递增修订号，"
@@ -39,6 +39,9 @@ app = FastAPI(
         "被多辆作业车同时占用的时段，返回达到阈值的区间及区间内恒定的车次集合。"
         "近距离相遇复核按同一已提交读视图比较两车同时位于区内时的平面距离，"
         "按无序车次对返回距离严格小于阈值的正时长区间及区间最小距离。"
+        "单车危险区风险预算复核按同一已提交读视图核算一次作业内各区占用，"
+        "重叠区域同时占用只按最高权重计入，返回恒权重区间、各段与总计加权秒数"
+        "及累计值首次达到预算的时刻。"
     ),
 )
 
@@ -83,6 +86,7 @@ def index() -> dict:
             "GET  /api/v1/trips/{trip_id}/crossings",
             "POST /api/v1/zones/{zone_id}/co-occupancy",
             "POST /api/v1/zones/{zone_id}/proximity",
+            "POST /api/v1/trips/{trip_id}/risk-budget",
         ],
     }
 
@@ -238,6 +242,14 @@ def query_proximity(zone_id: str, body: ProximityQuery) -> dict:
     只在两车均有轨迹覆盖且同时位于区内时比较同一时刻平面距离，
     按无序车次对返回距离严格小于阈值的正时长区间及区间最小距离。"""
     return service.query_proximity(zone_id, body.model_dump())
+
+
+@app.post("/api/v1/trips/{trip_id}/risk-budget")
+def query_risk_budget(trip_id: str, body: RiskBudgetQuery) -> dict:
+    """单车一次作业危险区风险预算复核：区域配置与车次点集从同一已提交读视图读取，
+    重叠区域同时占用只按最高权重计入，返回恒权重正时长区间、各段与总计加权秒数，
+    以及累计加权秒数首次达到预算的时刻。"""
+    return service.query_risk_budget(trip_id, body.model_dump())
 
 
 if __name__ == "__main__":
